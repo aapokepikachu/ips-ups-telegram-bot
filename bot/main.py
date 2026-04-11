@@ -93,13 +93,14 @@ async def post_init(app: Application) -> None:
     await queue_mgr.start()
     app.bot_data["queue"] = queue_mgr
 
-    # Health-check server
-    if settings.PORT:
-        server = await asyncio.start_server(
-            _health_handler, "0.0.0.0", settings.PORT
-        )
-        app.bot_data["health_server"] = server
-        logger.info("Health-check server listening on port %d", settings.PORT)
+    # Health-check server — required for Render free-tier Web Service
+    import os
+    port = int(os.environ.get("PORT", settings.PORT or 10000))
+    server = await asyncio.start_server(
+        _health_handler, "0.0.0.0", port
+    )
+    app.bot_data["health_server"] = server
+    logger.info("Health-check server listening on port %d", port)
 
     # Set bot commands menu
     try:

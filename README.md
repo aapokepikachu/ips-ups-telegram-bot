@@ -253,31 +253,47 @@ Indexes are created automatically on first boot.
 
 ---
 
-## ☁️ Deploy to Render
+## ☁️ Deploy to Render (Free Tier)
 
-### Option A: Blueprint (recommended)
+### Step-by-step (Manual — Free)
 
-1. Push this repo to GitHub
-2. Go to [Render Dashboard](https://dashboard.render.com) → **New** → **Blueprint Instance**
-3. Connect your GitHub repo
-4. Render reads `render.yaml` and creates a **Background Worker**
-5. Add environment variables in the Render dashboard
-6. Deploy!
+1. Push your repo to GitHub
+2. Go to [Render Dashboard](https://dashboard.render.com)
+3. Click **New +** → **Web Service**
+4. Connect your GitHub repo
+5. Configure:
 
-### Option B: Manual
+| Setting | Value |
+|---|---|
+| **Name** | `ips-ups-patcher-bot` |
+| **Region** | Choose closest |
+| **Runtime** | `Python 3` |
+| **Build Command** | `pip install -r requirements.txt` |
+| **Start Command** | `python run.py` |
+| **Instance Type** | **Free** |
 
-1. **New** → **Background Worker**
-2. Connect your repo
-3. **Runtime:** Python 3
-4. **Build command:** `pip install -r requirements.txt`
-5. **Start command:** `python run.py`
-6. Add all env vars from `.env.example`
+6. Go to **Environment** tab and add these variables:
 
-### Keeping the bot alive
+| Key | Value |
+|---|---|
+| `BOT_TOKEN` | Your bot token |
+| `MONGO_URI` | Your MongoDB connection string |
+| `ADMIN_ID` | Your Telegram user ID |
+| `CHANNEL_ID` | Your private channel ID |
 
-Render free-tier workers may spin down. Options:
-- Set the `PORT` env var and use [UptimeRobot](https://uptimerobot.com) to ping `https://your-service.onrender.com/`
-- For the health endpoint, deploy as a **Web Service** instead of Worker and set `PORT`
+7. Click **Deploy** — done!
+
+> **Note:** Render provides the `PORT` variable automatically for Web Services. The bot binds to it and serves a health-check endpoint alongside the Telegram polling.
+
+### Keeping the bot alive (important!)
+
+Render free-tier Web Services **spin down after 15 minutes of inactivity**. To keep your bot running 24/7:
+
+1. Go to [UptimeRobot](https://uptimerobot.com) (free)
+2. Create a new **HTTP(s) monitor**
+3. Set URL to: `https://your-service-name.onrender.com/`
+4. Set interval to **5 minutes**
+5. Save — UptimeRobot will ping your bot, keeping it awake
 
 ---
 
