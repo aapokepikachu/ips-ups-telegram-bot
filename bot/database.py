@@ -7,7 +7,7 @@ Singleton ``Database`` instance — initialised once in ``post_init``.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -160,10 +160,43 @@ class Database:
         return await self.rom_mappings.find_one({"name": name})
 
     # ------------------------------------------------------------------
-    # Cache
+    # Cache (with in-progress markers)
     # ------------------------------------------------------------------
     async def find_cache(self, cache_key: str) -> Optional[dict]:
-        return await self.cache_col.find_one({"cache_key": cache_key})
+        """Return a completed cache entry, or None."""
+        return await self.cache_col.find_one(
+            {"cache_key": cache_key, "status": "completed"}
+        )
+
+    async def mark_cache_in_progress(self, cache_key: str, user_id: int) -> bool:
+        """
+        Set an in-progress marker.  Returns True if set successfully.
+        Returns False if there is already an in-progress or completed entry.
+        """
+        try:
+            await self.cache_col.update_one(
+                {"cache_key": cache_key},
+                {
+                    "$setOnInsert": {
+                        "cache_key": cache_key,
+                        "status": "in_progress",
+                        "user_id": user_id,
+                        "started_at": utcnow(),
+                    }
+                },
+                upsert=True,
+            )
+            # Check if we actually set it (not overwriting a completed entry)
+            doc = await self.cache_col.find_one({"cache_key": cache_key})
+            return doc is not None and doc.get("status") == "in_progress"
+        except Exception:
+            return False
+
+    async def clear_cache_in_progress(self, cache_key: str) -> None:
+        """Remove a failed in-progress marker."""
+        await self.cache_col.delete_one(
+            {"cache_key": cache_key, "status": "in_progress"}
+        )
 
     async def store_cache(
         self,
@@ -174,11 +207,13 @@ class Database:
         rom_name: str,
         patch_type: str,
     ) -> None:
+        """Store a completed cache entry (overwrites in-progress)."""
         await self.cache_col.update_one(
             {"cache_key": cache_key},
             {
                 "$set": {
                     "cache_key": cache_key,
+                    "status": "completed",
                     "output_file_id": output_file_id,
                     "output_message_id": output_message_id,
                     "patch_hash": patch_hash,
@@ -219,13 +254,15 @@ class Database:
         if status in ("completed", "failed", "cancelled"):
             update["$set"]["completed_at"] = utcnow()
         await self.patch_jobs.update_one(
-            {"user_id": user_id, "status": {"$in": ["queued", "processing"]}},
+            {"user_id": user_id, "status": {"$in": ["queued", "processing",
+                                                      "downloading_rom", "downloading_patch",
+                                                      "patching", "uploading"]}},
             update,
         )
 
     async def get_active_job(self, user_id: int) -> Optional[dict]:
         return await self.patch_jobs.find_one(
-            {"user_id": user_id, "status": {"$in": ["queued", "processing"]}}
+            {"user_id": user_id, "status": {"$nin": ["completed", "failed", "cancelled"]}}
         )
 
     # ------------------------------------------------------------------

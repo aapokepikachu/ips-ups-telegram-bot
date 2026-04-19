@@ -10,7 +10,8 @@ from typing import Literal
 
 from bot.patching.ips import apply_ips, IPSError
 from bot.patching.ups import apply_ups, UPSError
-from bot.utils.constants import IPS_HEADER, UPS_HEADER
+from bot.patching.bps import apply_bps, BPSError
+from bot.utils.constants import IPS_HEADER, UPS_HEADER, BPS_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ class PatchError(Exception):
     """Umbrella error for any patching failure."""
 
 
-PatchType = Literal["IPS", "UPS"]
+PatchType = Literal["IPS", "UPS", "BPS"]
 
 
 def detect_patch_type(data: bytes) -> PatchType:
@@ -35,9 +36,11 @@ def detect_patch_type(data: bytes) -> PatchType:
         return "IPS"
     if data[:4] == UPS_HEADER:
         return "UPS"
+    if data[:4] == BPS_HEADER:
+        return "BPS"
     raise ValueError(
         "Unrecognised patch format. "
-        "Expected IPS (b'PATCH') or UPS (b'UPS1') header."
+        "Expected IPS (b'PATCH'), UPS (b'UPS1'), or BPS (b'BPS1') header."
     )
 
 
@@ -54,7 +57,7 @@ async def apply_patch(
     Raises
     ------
     PatchError
-        Wraps any IPS / UPS specific error.
+        Wraps any IPS / UPS / BPS specific error.
     """
     loop = asyncio.get_running_loop()
 
@@ -64,9 +67,11 @@ async def apply_patch(
                 return bytes(apply_ips(rom_data, patch_data))
             elif patch_type == "UPS":
                 return bytes(apply_ups(rom_data, patch_data))
+            elif patch_type == "BPS":
+                return bytes(apply_bps(rom_data, patch_data))
             else:
                 raise PatchError(f"Unknown patch type: {patch_type}")
-        except (IPSError, UPSError) as exc:
+        except (IPSError, UPSError, BPSError) as exc:
             raise PatchError(str(exc)) from exc
 
     try:

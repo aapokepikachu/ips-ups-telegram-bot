@@ -1,6 +1,6 @@
-# 🎮 IPS/UPS GBA ROM Patcher — Telegram Bot
+# 🎮 IPS/UPS/BPS GBA ROM Patcher — Telegram Bot
 
-A production-ready async Telegram bot that applies **IPS** and **UPS** patches to GBA ROM files. Built with Python 3.11+, python-telegram-bot, Motor (async MongoDB), and designed for one-click deployment on **Render**.
+A production-ready async Telegram bot that applies **IPS**, **UPS**, and **BPS** patches to GBA ROM files. Built with Python 3.11+, python-telegram-bot, Motor (async MongoDB), and designed for deployment on **Render** (free tier).
 
 > **Legal note:** This bot is designed exclusively for files the user owns or has permission to use. It does not facilitate bypassing copyright protections.
 
@@ -10,15 +10,19 @@ A production-ready async Telegram bot that applies **IPS** and **UPS** patches t
 
 | Feature | Description |
 |---|---|
-| **Auto-detect** | Detects `.ips` / `.ups` format on upload |
-| **Pure-Python patching** | No external binaries — IPS & UPS applied in-memory |
+| **Auto-detect** | Detects `.ips` / `.ups` / `.bps` format on upload |
+| **Pure-Python patching** | No external binaries — IPS, UPS & BPS applied in-memory |
+| **BPS support** | Full Beat Patching System with all 4 action types |
 | **Inline ROM selection** | Admin-managed ROM list via `/inedit` |
 | **Job queue** | Sequential processing with live position updates |
+| **Explicit job states** | `received → queued → downloading → patching → uploading → completed` |
 | **Caching** | SHA-256 cache key avoids re-patching identical combos |
-| **Progress bar** | Unicode block bar with stage labels |
+| **Timeout hardening** | Explicit timeouts on all API calls (120s for files) |
 | **Cancel anytime** | Graceful cancel at queue or processing stage |
+| **Thumbnail** | Configurable thumbnail sent on both fresh and cached results |
 | **Admin dashboard** | Broadcast, user stats, DB stats, thumbnail & caption |
-| **Health check** | Optional HTTP endpoint for uptime monitors |
+| **Large file support** | Optional local Bot API server for files > 20 MB |
+| **Health check** | HTTP endpoint for Render uptime |
 
 ---
 
@@ -33,10 +37,11 @@ A production-ready async Telegram bot that applies **IPS** and **UPS** patches t
 │   ├── patching/
 │   │   ├── ips.py            # IPS patch applier
 │   │   ├── ups.py            # UPS patch applier
+│   │   ├── bps.py            # BPS patch applier
 │   │   └── engine.py         # Detect + async apply wrapper
 │   ├── services/
-│   │   ├── queue_manager.py  # Async job queue
-│   │   ├── cache.py          # Hash-based cache lookup
+│   │   ├── queue_manager.py  # Async job queue with state tracking
+│   │   ├── cache.py          # Hash-based cache with in-progress markers
 │   │   └── progress.py       # Unicode progress bar
 │   ├── handlers/
 │   │   ├── user_commands.py  # /start, /help, /about, /ping, etc.
@@ -45,13 +50,14 @@ A production-ready async Telegram bot that applies **IPS** and **UPS** patches t
 │   │   ├── callbacks.py      # Inline button callback router
 │   │   └── errors.py         # Global error handler
 │   └── utils/
-│       ├── constants.py      # Magic bytes, limits, emoji
+│       ├── constants.py      # Magic bytes, limits, timeouts
 │       └── helpers.py        # Formatting, hashing, sanitization
 ├── run.py                    # Entry point
 ├── requirements.txt
 ├── Procfile
 ├── render.yaml
 ├── .env.example
+├── test_patching.py          # Functional tests
 └── README.md
 ```
 
@@ -69,8 +75,8 @@ A production-ready async Telegram bot that applies **IPS** and **UPS** patches t
 ### 1. Clone & install
 
 ```bash
-git clone <your-repo-url>
-cd IPS-UPS-Patch
+git clone https://github.com/aapokepikachu/ips-ups-telegram-bot.git
+cd ips-ups-telegram-bot
 pip install -r requirements.txt
 ```
 
@@ -91,10 +97,12 @@ cp .env.example .env
 | `DB_NAME` | ❌ | Database name (default: `ips_ups_bot`) |
 | `CACHE_CHANNEL_ID` | ❌ | Channel for cached outputs (default: same as `CHANNEL_ID`) |
 | `MAX_QUEUE_SIZE` | ❌ | Max queued jobs (default: `10`) |
-| `MAX_FILE_SIZE` | ❌ | Max patch file size in bytes (default: `52428800` = 50 MB) |
+| `MAX_FILE_SIZE` | ❌ | Max file size in bytes (default: `104857600` = 100 MB) |
 | `LOG_LEVEL` | ❌ | Logging level (default: `INFO`) |
 | `OWNER_NAME` | ❌ | Displayed in `/about` |
-| `PORT` | ❌ | HTTP port for health-check endpoint |
+| `PORT` | ❌ | HTTP port for health-check (auto-set by Render) |
+| `LOCAL_API_URL` | ❌ | Local Bot API server URL (see below) |
+| `LOCAL_API_FILE_URL` | ❌ | Local Bot API file URL (default: `LOCAL_API_URL/file`) |
 
 ### 3. Run locally
 
@@ -107,10 +115,10 @@ python run.py
 ## 🔄 Patch Workflow
 
 ```
-User sends .ips/.ups file
+User sends .ips/.ups/.bps file
         │
         ▼
-Bot detects type → "IPS file detected"
+Bot detects type → "IPS/UPS/BPS file detected"
         │
         ▼
 ┌─────────────────────────┐
@@ -139,14 +147,19 @@ User picks "FireRed v1.0"
 User taps "Proceed patching"
         │
         ▼
-[Check cache] → HIT → send cached file
+[Check cache] → HIT → send cached file (with thumbnail)
         │
        MISS
         │
         ▼
 [Download ROM → Apply patch → Upload result]
         │
-Progress bar updates live
+Progress bar updates live with state:
+  📥 Downloading ROM...
+  📥 Downloading patch...
+  🔧 Applying patch...
+  📤 Uploading patched file...
+  💾 Caching result...
         │
         ▼
 Patched .gba sent to user ✅
@@ -177,8 +190,24 @@ To **list** all ROMs: `/inedit` → **📋 List ROMs**.
 
 - When a patch is applied, the bot computes: `cache_key = SHA256(patch_hash + rom_file_id)`
 - The patched output is uploaded to the cache channel and the `file_id` is stored in MongoDB
-- Next time the **same patch + same ROM** combo is requested, the bot serves the cached file instantly
+- Next time the **same patch + same ROM** combo is requested, the bot serves the cached file instantly (with thumbnail)
 - No re-downloading or re-patching needed
+- **In-progress markers** prevent concurrent duplicate patching of the same combo
+- If a job fails, the in-progress marker is cleaned up automatically
+
+---
+
+## ⏱ Timeout & Error Handling
+
+| Operation | Timeout | On Failure |
+|---|---|---|
+| File download (ROM/patch) | 120 seconds | Clear error: "ROM download timed out" |
+| File upload (result) | 120 seconds | Clear error: "File upload timed out" |
+| Message edits (progress) | 60 seconds | Silently swallowed — job continues |
+| Patch application | No limit (thread) | Wrapped PatchError with details |
+| API calls (general) | 30 seconds | Default python-telegram-bot handling |
+
+All Telegram API calls during patching have explicit timeouts. The event loop is never blocked — patching runs in a thread executor.
 
 ---
 
@@ -192,8 +221,8 @@ To **list** all ROMs: `/inedit` → **📋 List ROMs**.
 | `/status` | Check your current job status |
 | `/queue` | View queue length and your position |
 | `/cancel` | Cancel your active or queued job |
-| `/formats` | Explain IPS and UPS formats |
-| `/about` | Bot info, host, database, owner |
+| `/formats` | Explain IPS, UPS, and BPS formats |
+| `/about` | Bot info, host, database, source code |
 | `/ping` | Bot latency |
 
 ## 🔐 Admin Commands
@@ -216,16 +245,8 @@ To **list** all ROMs: `/inedit` → **📋 List ROMs**.
 {filesize}  — formatted file size
 {user}      — user's display name
 {romname}   — selected ROM name
-{patchtype} — IPS or UPS
+{patchtype} — IPS, UPS, or BPS
 {time}      — UTC timestamp
-```
-
-**Example:**
-```
-/caption 📦 {filename}
-Size: {filesize}
-ROM: {romname}
-Patched by: {user}
 ```
 
 ---
@@ -239,8 +260,8 @@ Patched by: {user}
 | `users` | All bot users with activity and block status |
 | `settings` | Key-value store (caption, thumbnail, etc.) |
 | `rom_mappings` | ROM name → file_id mappings |
-| `patch_jobs` | Job history (queued, processing, completed, etc.) |
-| `cache` | SHA-256 key → cached output file_id |
+| `patch_jobs` | Job history with explicit states |
+| `cache` | SHA-256 key → cached output (with status field) |
 
 ### Setup
 
@@ -297,32 +318,96 @@ Render free-tier Web Services **spin down after 15 minutes of inactivity**. To k
 
 ---
 
+## 📦 Large File Support (Local Bot API)
+
+By default, the Telegram Bot API has these limits:
+- **Download:** 20 MB (bot downloading files)
+- **Upload:** 50 MB (bot sending files)
+
+Most GBA ROMs (FireRed, Emerald, Ruby) are ~16 MB and work fine with the standard API.
+
+### When you need the local Bot API
+
+If you have ROMs or patched outputs **larger than 20 MB**, you need to run a [local Telegram Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server):
+
+### Setup
+
+1. Build and run the local Bot API server:
+```bash
+# Clone and build
+git clone --recursive https://github.com/tdlib/telegram-bot-api.git
+cd telegram-bot-api
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build .
+
+# Run (get api_id and api_hash from https://my.telegram.org)
+./telegram-bot-api --api-id=YOUR_API_ID --api-hash=YOUR_API_HASH --local
+```
+
+2. Add to your `.env`:
+```bash
+LOCAL_API_URL=http://localhost:8081
+LOCAL_API_FILE_URL=http://localhost:8081/file
+```
+
+3. With local API, limits increase to:
+    - **Download:** ~2 GB
+    - **Upload:** ~2 GB
+
+### Cloud vs Local API comparison
+
+| Feature | Standard (Cloud) API | Local Bot API |
+|---|---|---|
+| Download limit | 20 MB | ~2 GB |
+| Upload limit | 50 MB | ~2 GB |
+| Setup required | None | Build + run server |
+| Render compatible | ✅ | ❌ (needs VPS) |
+| Cost | Free | VPS cost |
+
+> **Recommendation:** Use standard API for typical GBA patching. Only set up local API if you need ROMs > 20 MB.
+
+---
+
 ## ⚙️ Queue System
 
 - Only **1 job** runs at a time (configurable via `MAX_QUEUE_SIZE`)
 - Users see their **live queue position** which updates as jobs complete
 - **Duplicate prevention:** one active job per user
 - **Cancel anytime:** the cancel button sets an `asyncio.Event` checked between processing stages
+- **Idempotent retries:** if a job was already completed, the cached output is reused
+
+### Job States
+
+```
+received → queued → downloading_rom → downloading_patch →
+patching → uploading → completed
+                                   ↘ failed
+                                   ↘ cancelled
+```
 
 ---
 
 ## 🔒 Security & Reliability
 
-- File type validated by extension (`.ips` / `.ups` only)
-- File size capped at 50 MB (configurable)
+- File type validated by extension (`.ips` / `.ups` / `.bps` only)
+- File size capped at 100 MB (configurable)
 - Invalid/corrupted patches return user-friendly errors
-- CRC-32 verification for UPS patches
+- CRC-32 verification for UPS and BPS patches
 - All errors logged; bot never crashes on bad input
 - Admin commands restricted to `ADMIN_ID`
 - Temp data freed from memory after each job
 - No subprocess usage — pure Python patching
+- Cache in-progress markers prevent concurrent double-patching
+- Explicit timeouts on all file operations (120s)
+- Thread executor for CPU-bound patching (event loop stays responsive)
 
 ---
 
 ## 📝 Notes
 
-- **Telegram download limit:** The bot can download files up to **20 MB** via `get_file()`. Most GBA ROMs (FireRed, Emerald, Ruby) are ~16 MB and work fine. For ROMs >20 MB, you'd need a [local Telegram Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server).
 - **Motor deprecation:** Motor is deprecated in favor of `pymongo[async]`. The current implementation uses Motor 3.6 which is fully functional. Migration to PyMongo Async is straightforward when needed.
+- **Render cold starts:** Free-tier Render services take ~30 seconds to warm up after sleeping. The first message after a sleep period may be slow.
 
 ---
 

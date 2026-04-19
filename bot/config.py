@@ -29,12 +29,14 @@ class Settings:
     LOG_LEVEL: str
     OWNER_NAME: str
     PORT: Optional[int]
+    LOCAL_API_URL: Optional[str]       # e.g. http://localhost:8081
+    LOCAL_API_FILE_URL: Optional[str]  # e.g. http://localhost:8081/file
 
 
 def load_settings() -> Settings:
     """
     Build a Settings instance from the environment.
-    Raises ``KeyError`` / ``ValueError`` for missing or invalid required vars.
+    Raises ``RuntimeError`` for missing required vars.
     """
     bot_token = os.environ.get("BOT_TOKEN")
     if not bot_token:
@@ -53,6 +55,7 @@ def load_settings() -> Settings:
         raise RuntimeError("CHANNEL_ID environment variable is required")
 
     port_str = os.environ.get("PORT")
+    local_api = os.environ.get("LOCAL_API_URL")
 
     return Settings(
         BOT_TOKEN=bot_token,
@@ -62,10 +65,15 @@ def load_settings() -> Settings:
         CHANNEL_ID=int(channel_id),
         CACHE_CHANNEL_ID=int(os.getenv("CACHE_CHANNEL_ID", channel_id)),
         MAX_QUEUE_SIZE=int(os.getenv("MAX_QUEUE_SIZE", "10")),
-        MAX_FILE_SIZE=int(os.getenv("MAX_FILE_SIZE", str(50 * 1024 * 1024))),
+        MAX_FILE_SIZE=int(os.getenv("MAX_FILE_SIZE", str(100 * 1024 * 1024))),
         LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO"),
         OWNER_NAME=os.getenv("OWNER_NAME", "Bot Owner"),
         PORT=int(port_str) if port_str else None,
+        LOCAL_API_URL=local_api,
+        LOCAL_API_FILE_URL=os.environ.get(
+            "LOCAL_API_FILE_URL",
+            f"{local_api}/file" if local_api else None,
+        ),
     )
 
 

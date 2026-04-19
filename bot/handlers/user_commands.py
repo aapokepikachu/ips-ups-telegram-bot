@@ -27,10 +27,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db.upsert_user(update.effective_user)
 
     await update.message.reply_text(
-        "👋 **Welcome to the IPS/UPS ROM Patcher Bot!**\n\n"
-        "I can apply `.ips` and `.ups` patches to GBA ROM files.\n\n"
+        "👋 **Welcome to the IPS/UPS/BPS ROM Patcher Bot!**\n\n"
+        "I can apply `.ips`, `.ups`, and `.bps` patches to GBA ROM files.\n\n"
         "**How to use:**\n"
-        "1️⃣ Send me a `.ips` or `.ups` patch file\n"
+        "1️⃣ Send me a `.ips`, `.ups`, or `.bps` patch file\n"
         "2️⃣ Select the base ROM from the list\n"
         "3️⃣ Press **Proceed patching** and I'll send you the result!\n\n"
         "Use /help for detailed instructions.",
@@ -43,10 +43,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------------
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Full user command reference."""
+    api_note = ""
+    if settings.LOCAL_API_URL:
+        api_note = "\n• Large file support enabled (local Bot API)\n"
+
     await update.message.reply_text(
         "📖 **Bot Help**\n\n"
         "**Patch Workflow:**\n"
-        "• Send a `.ips` or `.ups` patch file (max 50 MB)\n"
+        "• Send a `.ips`, `.ups`, or `.bps` patch file (max 50 MB)\n"
         "• I'll detect the format automatically\n"
         "• Tap **Select Rom file** to pick a base ROM\n"
         "• Tap **Proceed patching** to start\n"
@@ -64,7 +68,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "**Notes:**\n"
         "• Only one job per user at a time\n"
         "• Previously patched combos are cached for speed\n"
-        "• You do NOT need to send the ROM — just the patch file",
+        f"• You do NOT need to send the ROM — just the patch file{api_note}",
         parse_mode="Markdown",
     )
 
@@ -74,15 +78,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------------
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bot information."""
+    api_mode = "Local Bot API ✅" if settings.LOCAL_API_URL else "Standard Bot API"
     await update.message.reply_text(
         "ℹ️ **About This Bot**\n\n"
-        "🔧 **Purpose:** Apply IPS/UPS patches to GBA ROMs\n"
+        "🔧 **Purpose:** Apply IPS/UPS/BPS patches to GBA ROMs\n"
         f"👤 **Owner:** {settings.OWNER_NAME}\n"
         f"🗄 **Database:** MongoDB (`{settings.DB_NAME}`)\n"
+        f"🌐 **API Mode:** {api_mode}\n"
         "☁️ **Hosted on:** Render\n"
-        "⚡ **Engine:** Pure-Python IPS & UPS patcher\n\n"
+        "⚡ **Engine:** Pure-Python IPS, UPS & BPS patcher\n\n"
+        "📂 [Source Code](https://github.com/aapokepikachu/ips-ups-telegram-bot)\n\n"
         "_Only for files you own or have permission to use._",
         parse_mode="Markdown",
+        disable_web_page_preview=True,
     )
 
 
@@ -174,7 +182,13 @@ async def formats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "• Header: `UPS1`\n"
         "• No size limit\n"
         "• XOR-based with CRC-32 verification\n\n"
-        "_Both formats are applied to GBA (.gba) ROM files._",
+        "**BPS** (Beat Patching System)\n"
+        "• Extension: `.bps`\n"
+        "• Header: `BPS1`\n"
+        "• No size limit\n"
+        "• 4 action types with CRC-32 verification\n"
+        "• Most advanced format, preferred for modern hacks\n\n"
+        "_All formats are applied to GBA (.gba) ROM files._",
         parse_mode="Markdown",
     )
 
@@ -192,7 +206,7 @@ async def patch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if reply and reply.document:
         filename = reply.document.file_name or ""
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        if ext in ("ips", "ups"):
+        if ext in ("ips", "ups", "bps"):
             # Defer to the document handler logic
             from bot.handlers.patch_flow import process_patch_document
             await process_patch_document(update, context, reply.document)
@@ -200,7 +214,7 @@ async def patch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "📋 **How to patch:**\n\n"
-        "1. Send me a `.ips` or `.ups` file\n"
+        "1. Send me a `.ips`, `.ups`, or `.bps` file\n"
         "2. I'll detect the format automatically\n"
         "3. Or reply to a patch file with /patch\n\n"
         "_You don't need to send the ROM — just the patch file!_",

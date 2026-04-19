@@ -16,6 +16,10 @@ from telegram.ext import ContextTypes
 
 from bot.config import settings
 from bot.patching.engine import detect_patch_type
+from bot.utils.constants import (
+    SUPPORTED_EXTENSIONS,
+    TELEGRAM_DOWNLOAD_LIMIT,
+)
 from bot.utils.helpers import compute_patch_hash, format_size, user_display_name
 
 logger = logging.getLogger(__name__)
@@ -60,7 +64,7 @@ async def process_patch_document(
     filename = document.file_name or "patch"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-    if ext not in ("ips", "ups"):
+    if ext not in SUPPORTED_EXTENSIONS:
         return  # silently ignore non-patch files
 
     # Size check
@@ -70,6 +74,22 @@ async def process_patch_document(
             parse_mode="Markdown",
         )
         return
+
+    # Warn if file exceeds standard Bot API download limit and no local API
+    if (
+        document.file_size
+        and document.file_size > TELEGRAM_DOWNLOAD_LIMIT
+        and not settings.LOCAL_API_URL
+    ):
+        await update.effective_message.reply_text(
+            f"⚠️ This file is **{format_size(document.file_size)}** "
+            f"which exceeds the standard Bot API download limit of "
+            f"**{format_size(TELEGRAM_DOWNLOAD_LIMIT)}**.\n\n"
+            "The download may fail. Ask the admin to set up a "
+            "[local Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server) "
+            "for large file support.",
+            parse_mode="Markdown",
+        )
 
     # Check for existing session / active job
     queue_mgr = context.bot_data["queue"]
@@ -82,11 +102,15 @@ async def process_patch_document(
 
     # Download patch to detect type and compute hash
     try:
-        tg_file = await context.bot.get_file(document.file_id)
+        tg_file = await context.bot.get_file(document.file_id, read_timeout=120)
         patch_data = bytes(await tg_file.download_as_bytearray())
     except Exception as exc:
         logger.error("Failed to download patch file: %s", exc)
-        await update.effective_message.reply_text("❌ Failed to download the patch file. Please try again.")
+        await update.effective_message.reply_text(
+            "❌ Failed to download the patch file. Please try again.\n"
+            f"`{exc}`",
+            parse_mode="Markdown",
+        )
         return
 
     # Detect patch type
@@ -113,7 +137,7 @@ async def process_patch_document(
         "filename": filename,
     }
 
-    emoji = "📋" if patch_type == "IPS" else "📦"
+    emoji = "📋" if patch_type == "IPS" else ("📦" if patch_type == "UPS" else "🔶")
     msg = await update.effective_message.reply_text(
         f"{emoji} **{patch_type} file detected**\n\n"
         f"📄 File: `{filename}`\n"
@@ -135,7 +159,7 @@ async def process_patch_document(
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     MessageHandler target for ``filters.Document.ALL``.
-    Auto-detects ``.ips`` / ``.ups`` files and starts the patch flow.
+    Auto-detects ``.ips`` / ``.ups`` / ``.bps`` files and starts the patch flow.
     """
     if not update.message or not update.message.document:
         return

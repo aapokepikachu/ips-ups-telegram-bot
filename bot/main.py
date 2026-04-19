@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from telegram import BotCommand
 from telegram.ext import (
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
-# Health-check server (optional, for uptime monitors)
+# Health-check server (required for Render free-tier Web Service)
 # ------------------------------------------------------------------
 async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Minimal HTTP response for health checks."""
@@ -94,7 +95,6 @@ async def post_init(app: Application) -> None:
     app.bot_data["queue"] = queue_mgr
 
     # Health-check server — required for Render free-tier Web Service
-    import os
     port = int(os.environ.get("PORT", settings.PORT or 10000))
     server = await asyncio.start_server(
         _health_handler, "0.0.0.0", port
@@ -120,22 +120,20 @@ async def post_init(app: Application) -> None:
     except Exception:
         logger.warning("Failed to set bot commands menu")
 
-    logger.info("Bot initialised ✓")
+    api_mode = "Local API" if settings.LOCAL_API_URL else "Standard API"
+    logger.info("Bot initialised ✓ (%s)", api_mode)
 
 
 async def post_shutdown(app: Application) -> None:
     """Clean up resources."""
-    # Stop queue
     queue_mgr = app.bot_data.get("queue")
     if queue_mgr:
         await queue_mgr.stop()
 
-    # Close DB
     db = app.bot_data.get("db")
     if db:
         db.close()
 
-    # Stop health server
     health_server = app.bot_data.get("health_server")
     if health_server:
         health_server.close()
@@ -149,14 +147,32 @@ async def post_shutdown(app: Application) -> None:
 # ------------------------------------------------------------------
 def create_app() -> Application:
     """Build the fully-configured Application instance."""
-    app = (
+    builder = (
         ApplicationBuilder()
         .token(settings.BOT_TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .get_updates_read_timeout(10)
+        .get_updates_write_timeout(10)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .concurrent_updates(True)
-        .build()
     )
+
+    # Local Bot API server support for files > 20 MB
+    if settings.LOCAL_API_URL:
+        builder = builder.base_url(
+            f"{settings.LOCAL_API_URL}/bot"
+        ).base_file_url(
+            f"{settings.LOCAL_API_FILE_URL}/bot"
+            if settings.LOCAL_API_FILE_URL
+            else f"{settings.LOCAL_API_URL}/file/bot"
+        )
+        logger.info("Using local Bot API: %s", settings.LOCAL_API_URL)
+
+    app = builder.build()
 
     # ---- Group 0: primary handlers ----
 

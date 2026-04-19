@@ -1,10 +1,11 @@
 """
-Cache service — check / store patched outputs using SHA-256 keys.
+Cache helpers — thin wrappers around Database.find_cache / store_cache.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from bot.database import Database
 from bot.utils.helpers import compute_cache_key
@@ -13,17 +14,18 @@ logger = logging.getLogger(__name__)
 
 
 async def check_cache(
-    db: Database, patch_hash: str, rom_file_id: str
-) -> dict | None:
+    db: Database,
+    patch_hash: str,
+    rom_file_id: str,
+) -> Optional[dict]:
     """
-    Return the cached record if this patch+ROM combo was processed before,
-    otherwise ``None``.
+    Look up a cached patching result.
+
+    Returns the cache document (with ``output_file_id``) or ``None``.
+    Only returns *completed* entries — in-progress markers are invisible.
     """
     key = compute_cache_key(patch_hash, rom_file_id)
-    cached = await db.find_cache(key)
-    if cached:
-        logger.info("Cache HIT for key %s", key[:16])
-    return cached
+    return await db.find_cache(key)
 
 
 async def store_in_cache(
@@ -35,7 +37,10 @@ async def store_in_cache(
     rom_name: str,
     patch_type: str,
 ) -> None:
-    """Persist a patched output in the cache collection."""
+    """
+    Store a completed patching result in the cache.
+    Overwrites any in-progress marker for the same key.
+    """
     key = compute_cache_key(patch_hash, rom_file_id)
     await db.store_cache(
         cache_key=key,
@@ -45,4 +50,4 @@ async def store_in_cache(
         rom_name=rom_name,
         patch_type=patch_type,
     )
-    logger.info("Cached output for key %s", key[:16])
+    logger.info("Cached result: %s (%s → %s)", key[:16], patch_type, rom_name)

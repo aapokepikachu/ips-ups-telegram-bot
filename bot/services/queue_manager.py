@@ -3,6 +3,10 @@ Async job queue — processes one patch job at a time.
 
 Uses an ``asyncio.Queue`` backed by a tracking list so we can
 iterate queued jobs to update their position messages.
+
+Job states:
+    received → queued → downloading_rom → downloading_patch →
+    patching → uploading → completed | failed | cancelled
 """
 
 from __future__ import annotations
@@ -20,18 +24,23 @@ from telegram.error import BadRequest, Forbidden, TimedOut
 from bot.config import settings
 from bot.database import Database
 from bot.patching.engine import apply_patch, PatchError
-from bot.services.cache import check_cache, store_in_cache
 from bot.services.progress import render_progress
-from bot.utils.constants import DEFAULT_CAPTION
+from bot.utils.constants import (
+    DEFAULT_CAPTION,
+    FILE_DOWNLOAD_TIMEOUT,
+    FILE_UPLOAD_TIMEOUT,
+)
 from bot.utils.helpers import (
     compute_cache_key,
-    compute_patch_hash,
     format_size,
-    user_display_name,
     utcnow,
 )
 
 logger = logging.getLogger(__name__)
+
+# Timeout constants (seconds)
+_DL_TIMEOUT = FILE_DOWNLOAD_TIMEOUT
+_UL_TIMEOUT = FILE_UPLOAD_TIMEOUT
 
 
 class DuplicateJobError(Exception):
@@ -179,7 +188,7 @@ class QueueManager:
                 await self._safe_edit(
                     job.chat_id,
                     job.status_message_id,
-                    f"❌ Patching failed:\n`{exc}`",
+                    f"❌ **Patching failed:**\n`{exc}`",
                     parse_mode="Markdown",
                 )
             finally:
@@ -190,14 +199,15 @@ class QueueManager:
                 await self._update_positions()
 
     async def _process_job(self, job: PatchJob) -> None:
-        """Execute a single patching job with progress updates."""
+        """Execute a single patching job with explicit state transitions."""
         cancel_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]]
         )
+        cache_key = compute_cache_key(job.patch_hash, job.rom_file_id)
 
-        # ---- Stage 1: Check cache ----
+        # ---- State: CHECKING CACHE ----
         await self._progress(job, "🔍 Checking cache...", 5, cancel_kb)
-        cached = await check_cache(self._db, job.patch_hash, job.rom_file_id)
+        cached = await self._db.find_cache(cache_key)
         if cached:
             if job.cancel_event.is_set():
                 await self._send_cancelled(job)
@@ -207,145 +217,205 @@ class QueueManager:
             await self._db.update_job_status(job.user_id, "completed")
             return
 
-        # ---- Stage 2: Download ROM ----
-        if job.cancel_event.is_set():
-            await self._send_cancelled(job)
-            return
-        await self._progress(job, "📥 Downloading ROM...", 15, cancel_kb)
+        # Mark cache as in-progress to block concurrent duplicates
+        await self._db.mark_cache_in_progress(cache_key, job.user_id)
+
         try:
-            rom_file = await self._bot.get_file(job.rom_file_id)
-            rom_data = bytes(await rom_file.download_as_bytearray())
-        except Exception as exc:
-            raise PatchError(f"Failed to download ROM: {exc}") from exc
-
-        # ---- Stage 3: Download patch ----
-        if job.cancel_event.is_set():
-            await self._send_cancelled(job)
-            return
-        await self._progress(job, "📥 Downloading patch...", 30, cancel_kb)
-        try:
-            patch_file = await self._bot.get_file(job.patch_file_id)
-            patch_data = bytes(await patch_file.download_as_bytearray())
-        except Exception as exc:
-            raise PatchError(f"Failed to download patch: {exc}") from exc
-
-        # ---- Stage 4: Apply patch ----
-        if job.cancel_event.is_set():
-            await self._send_cancelled(job)
-            return
-        await self._progress(job, "🔧 Applying patch...", 50, cancel_kb)
-        try:
-            patched_data = await apply_patch(rom_data, patch_data, job.patch_type)
-        except PatchError:
-            raise
-        except Exception as exc:
-            raise PatchError(f"Patching error: {exc}") from exc
-
-        # Free source data early
-        del rom_data, patch_data
-
-        # ---- Stage 5: Upload result ----
-        if job.cancel_event.is_set():
-            await self._send_cancelled(job)
-            return
-        await self._progress(job, "📤 Uploading patched file...", 75, cancel_kb)
-
-        # Build output filename
-        base_name = job.patch_filename.rsplit(".", 1)[0] if "." in job.patch_filename else job.patch_filename
-        out_filename = f"{base_name}.gba"
-
-        # Build caption
-        caption_template = await self._db.get_setting("caption_template") or DEFAULT_CAPTION
-        try:
-            caption = caption_template.format(
-                filename=out_filename,
-                filesize=format_size(len(patched_data)),
-                user=job.user_display,
-                romname=job.rom_name,
-                patchtype=job.patch_type,
-                time=utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-            )
-        except (KeyError, IndexError):
-            caption = f"📦 {out_filename}"
-
-        # Get thumbnail
-        thumb_io = None
-        thumb_file_id = await self._db.get_setting("thumbnail_file_id")
-        if thumb_file_id:
+            # ---- State: DOWNLOADING ROM ----
+            if job.cancel_event.is_set():
+                await self._send_cancelled(job)
+                return
+            await self._db.update_job_status(job.user_id, "downloading_rom")
+            await self._progress(job, "📥 Downloading ROM...", 15, cancel_kb)
             try:
-                tf = await self._bot.get_file(thumb_file_id)
-                thumb_bytes = await tf.download_as_bytearray()
-                thumb_io = BytesIO(bytes(thumb_bytes))
-                thumb_io.name = "thumb.jpg"
+                rom_file = await self._bot.get_file(
+                    job.rom_file_id,
+                    read_timeout=_DL_TIMEOUT,
+                )
+                rom_data = bytes(await rom_file.download_as_bytearray())
+            except TimedOut as exc:
+                raise PatchError(
+                    f"ROM download timed out ({_DL_TIMEOUT}s). "
+                    "The file may be too large for standard Bot API. "
+                    "Ask the admin to set up a local Bot API server."
+                ) from exc
+            except Exception as exc:
+                raise PatchError(f"Failed to download ROM: {exc}") from exc
+
+            # ---- State: DOWNLOADING PATCH ----
+            if job.cancel_event.is_set():
+                await self._send_cancelled(job)
+                return
+            await self._db.update_job_status(job.user_id, "downloading_patch")
+            await self._progress(job, "📥 Downloading patch...", 30, cancel_kb)
+            try:
+                patch_file = await self._bot.get_file(
+                    job.patch_file_id,
+                    read_timeout=_DL_TIMEOUT,
+                )
+                patch_data = bytes(await patch_file.download_as_bytearray())
+            except TimedOut as exc:
+                raise PatchError(
+                    f"Patch download timed out ({_DL_TIMEOUT}s)."
+                ) from exc
+            except Exception as exc:
+                raise PatchError(f"Failed to download patch: {exc}") from exc
+
+            # ---- State: PATCHING ----
+            if job.cancel_event.is_set():
+                await self._send_cancelled(job)
+                return
+            await self._db.update_job_status(job.user_id, "patching")
+            await self._progress(job, "🔧 Applying patch...", 50, cancel_kb)
+            try:
+                patched_data = await apply_patch(rom_data, patch_data, job.patch_type)
+            except PatchError:
+                raise
+            except Exception as exc:
+                raise PatchError(f"Patching error: {exc}") from exc
+
+            # Free source data early
+            del rom_data, patch_data
+
+            # ---- State: UPLOADING ----
+            if job.cancel_event.is_set():
+                await self._send_cancelled(job)
+                return
+            await self._db.update_job_status(job.user_id, "uploading")
+            await self._progress(job, "📤 Uploading patched file...", 75, cancel_kb)
+
+            # Build output filename
+            base_name = (
+                job.patch_filename.rsplit(".", 1)[0]
+                if "." in job.patch_filename
+                else job.patch_filename
+            )
+            out_filename = f"{base_name}.gba"
+
+            # Build caption
+            caption_template = (
+                await self._db.get_setting("caption_template") or DEFAULT_CAPTION
+            )
+            try:
+                caption = caption_template.format(
+                    filename=out_filename,
+                    filesize=format_size(len(patched_data)),
+                    user=job.user_display,
+                    romname=job.rom_name,
+                    patchtype=job.patch_type,
+                    time=utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                )
+            except (KeyError, IndexError):
+                caption = f"📦 {out_filename}"
+
+            # Get thumbnail
+            thumb_io = await self._get_thumbnail()
+
+            # Send patched file to user
+            patched_io = BytesIO(patched_data)
+            patched_io.name = out_filename
+
+            try:
+                sent_msg = await self._bot.send_document(
+                    chat_id=job.chat_id,
+                    document=patched_io,
+                    filename=out_filename,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    thumbnail=thumb_io,
+                    read_timeout=_UL_TIMEOUT,
+                    write_timeout=_UL_TIMEOUT,
+                )
+            except TimedOut as exc:
+                raise PatchError(
+                    f"File upload timed out ({_UL_TIMEOUT}s). "
+                    "The output may be too large for standard Bot API."
+                ) from exc
+
+            # ---- Stage: CACHING RESULT ----
+            await self._progress(job, "💾 Caching result...", 95, cancel_kb)
+
+            cache_file_id = None
+            cache_msg_id = None
+            try:
+                cache_io = BytesIO(patched_data)
+                cache_io.name = out_filename
+                cache_msg = await self._bot.send_document(
+                    chat_id=settings.CACHE_CHANNEL_ID,
+                    document=cache_io,
+                    filename=out_filename,
+                    caption=f"Cache: {out_filename} | ROM: {job.rom_name} | {job.patch_type}",
+                    read_timeout=_UL_TIMEOUT,
+                    write_timeout=_UL_TIMEOUT,
+                )
+                cache_file_id = cache_msg.document.file_id
+                cache_msg_id = cache_msg.message_id
             except Exception:
-                logger.warning("Failed to download thumbnail, skipping")
+                logger.warning("Failed to upload to cache channel, continuing")
 
-        # Send patched file to user
-        patched_io = BytesIO(patched_data)
-        patched_io.name = out_filename
+            if cache_file_id:
+                await self._db.store_cache(
+                    cache_key=cache_key,
+                    output_file_id=cache_file_id,
+                    output_message_id=cache_msg_id,
+                    patch_hash=job.patch_hash,
+                    rom_name=job.rom_name,
+                    patch_type=job.patch_type,
+                )
+            else:
+                # Clean up the in-progress marker if caching failed
+                await self._db.clear_cache_in_progress(cache_key)
 
-        sent_msg = await self._bot.send_document(
-            chat_id=job.chat_id,
-            document=patched_io,
-            filename=out_filename,
-            caption=caption,
-            parse_mode="Markdown",
-            thumbnail=thumb_io,
-        )
+            del patched_data  # free memory
 
-        # ---- Stage 6: Cache the result ----
-        await self._progress(job, "💾 Caching result...", 95, cancel_kb)
-
-        # Upload to cache channel
-        cache_file_id = None
-        cache_msg_id = None
-        try:
-            cache_io = BytesIO(patched_data)
-            cache_io.name = out_filename
-            cache_msg = await self._bot.send_document(
-                chat_id=settings.CACHE_CHANNEL_ID,
-                document=cache_io,
-                filename=out_filename,
-                caption=f"Cache: {out_filename} | ROM: {job.rom_name} | {job.patch_type}",
+            # ---- COMPLETED ----
+            await self._db.update_job_status(job.user_id, "completed")
+            await self._safe_edit(
+                job.chat_id,
+                job.status_message_id,
+                f"✅ **Patching complete!**\n\n"
+                f"🎮 ROM: {job.rom_name}\n"
+                f"🔧 Patch: {job.patch_type}\n"
+                f"📄 File: `{out_filename}`",
+                parse_mode="Markdown",
             )
-            cache_file_id = cache_msg.document.file_id
-            cache_msg_id = cache_msg.message_id
+            logger.info("Job completed for user %d", job.user_id)
+
         except Exception:
-            logger.warning("Failed to upload to cache channel, continuing")
-
-        if cache_file_id:
-            await store_in_cache(
-                db=self._db,
-                patch_hash=job.patch_hash,
-                rom_file_id=job.rom_file_id,
-                output_file_id=cache_file_id,
-                output_message_id=cache_msg_id,
-                rom_name=job.rom_name,
-                patch_type=job.patch_type,
-            )
-
-        del patched_data  # free memory
-
-        # ---- Done ----
-        await self._db.update_job_status(job.user_id, "completed")
-        await self._safe_edit(
-            job.chat_id,
-            job.status_message_id,
-            f"✅ **Patching complete!**\n\n"
-            f"🎮 ROM: {job.rom_name}\n"
-            f"🔧 Patch: {job.patch_type}\n"
-            f"📄 File: `{out_filename}`",
-            parse_mode="Markdown",
-        )
-        logger.info("Job completed for user %d", job.user_id)
+            # Clean up in-progress cache marker on any failure
+            await self._db.clear_cache_in_progress(cache_key)
+            raise
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    async def _get_thumbnail(self) -> Optional[BytesIO]:
+        """Download the admin-configured thumbnail, or None."""
+        thumb_file_id = await self._db.get_setting("thumbnail_file_id")
+        if not thumb_file_id:
+            return None
+        try:
+            tf = await self._bot.get_file(
+                thumb_file_id, read_timeout=_DL_TIMEOUT
+            )
+            thumb_bytes = await tf.download_as_bytearray()
+            thumb_io = BytesIO(bytes(thumb_bytes))
+            thumb_io.name = "thumb.jpg"
+            return thumb_io
+        except Exception:
+            logger.warning("Failed to download thumbnail, skipping")
+            return None
+
     async def _send_cached(self, job: PatchJob, file_id: str) -> None:
-        """Forward a cached file to the user."""
-        caption_template = await self._db.get_setting("caption_template") or DEFAULT_CAPTION
-        base_name = job.patch_filename.rsplit(".", 1)[0] if "." in job.patch_filename else job.patch_filename
+        """Forward a cached file to the user — with thumbnail."""
+        caption_template = (
+            await self._db.get_setting("caption_template") or DEFAULT_CAPTION
+        )
+        base_name = (
+            job.patch_filename.rsplit(".", 1)[0]
+            if "." in job.patch_filename
+            else job.patch_filename
+        )
         out_filename = f"{base_name}.gba"
         try:
             caption = caption_template.format(
@@ -359,16 +429,8 @@ class QueueManager:
         except (KeyError, IndexError):
             caption = f"📦 {out_filename}"
 
-        thumb_io = None
-        thumb_file_id = await self._db.get_setting("thumbnail_file_id")
-        if thumb_file_id:
-            try:
-                tf = await self._bot.get_file(thumb_file_id)
-                thumb_bytes = await tf.download_as_bytearray()
-                thumb_io = BytesIO(bytes(thumb_bytes))
-                thumb_io.name = "thumb.jpg"
-            except Exception:
-                pass
+        # Always send thumbnail on cache hit
+        thumb_io = await self._get_thumbnail()
 
         await self._bot.send_document(
             chat_id=job.chat_id,
@@ -376,6 +438,8 @@ class QueueManager:
             caption=caption,
             parse_mode="Markdown",
             thumbnail=thumb_io,
+            read_timeout=_UL_TIMEOUT,
+            write_timeout=_UL_TIMEOUT,
         )
         await self._safe_edit(
             job.chat_id,
@@ -393,7 +457,10 @@ class QueueManager:
             await self._bot.delete_message(job.chat_id, job.status_message_id)
         except Exception:
             pass
-        await self._bot.send_message(job.chat_id, "❌ The process canceled")
+        try:
+            await self._bot.send_message(job.chat_id, "❌ The process canceled")
+        except Exception:
+            pass
 
     async def _progress(
         self,
